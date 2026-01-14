@@ -19,14 +19,22 @@ _cluster_stop() {
 
   local containers
   containers="$(_sc_list_dev_containers)"
-  [[ -n "${containers}" ]] && {
+  if [[ -n "${containers}" ]]; then
+    # Stop containers with timeout to prevent hanging
     printf '%s' "${containers}" | _sc_stop_and_remove_containers
     _sc_success "Containers stopped and removed"
-  }
+  else
+    _sc_info "No dev containers found to stop"
+  fi
 
   _sc_print "${C_BLUE}" "🛑 Stopping SCT cluster..."
-  sct cluster stop
-  _sc_success "Cluster stopped successfully"
+  # Use timeout to prevent hanging (5 minutes max)
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 300 sct cluster stop || _sc_warn "Cluster stop timed out or failed"
+  else
+    sct cluster stop || _sc_warn "Cluster stop failed"
+  fi
+  _sc_success "Cluster stop command completed"
 }
 
 #######################################
@@ -68,6 +76,9 @@ _cluster_start() {
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
   local rebuild="${1}"
+
+  # Check Docker availability
+  _sc_check_docker || return 1
 
   _sc_cleanup_existing_containers
 

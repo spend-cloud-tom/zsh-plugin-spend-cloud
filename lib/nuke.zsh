@@ -106,9 +106,11 @@ _nuke_get_container() {
 _nuke_sql() {
   local container="${1}"
   shift
-  local -a cmd=(docker exec -i "${container}" mysql -u"${DB_USERNAME}" -h "${DB_SERVICES_HOST}" "${NUKE_CONFIG_DB}")
-  [[ -n "${DB_PASSWORD}" ]] && cmd+=(-p"${DB_PASSWORD}")
-  "${cmd[@]}" -N -e "$*" 2>/dev/null
+  local -a cmd=(docker exec -i "${container}" bash -lc)
+  local mysql_cmd="mysql -u${DB_USERNAME} -h ${DB_SERVICES_HOST}"
+  [[ -n "${DB_PASSWORD}" ]] && mysql_cmd+=" -p${DB_PASSWORD}"
+  mysql_cmd+=" ${NUKE_CONFIG_DB} -N -e \"$*\""
+  "${cmd[@]}" "${mysql_cmd}" 2>/dev/null
 }
 
 #######################################
@@ -123,7 +125,7 @@ _nuke_sql() {
 #######################################
 _nuke_get_clients() {
   local container="${1}" settings_table="${2}"
-  local folder_clients settings_clients table_clients
+  local folder_clients settings_clients db_clients
 
   folder_clients="$(docker exec "${container}" bash -lc \
     'ls -1 /data 2>/dev/null | grep -Ev "^(test|lost\+found)$"' || true)"
@@ -132,7 +134,11 @@ _nuke_get_clients() {
     "SELECT DISTINCT \`043\` FROM ${settings_table} WHERE \`043\` IS NOT NULL AND \`043\` != ''" |
     tr '[:upper:]' '[:lower:]' || true)"
 
-  printf '%s\n%s\n%s\n' "${folder_clients}" "${settings_clients}" "${table_clients}" |
+  # Also check for existing databases using Laravel's tinker
+  db_clients="$(docker exec "${container}" php artisan tinker --execute="echo implode(PHP_EOL, array_map(fn(\$db) => \$db->Database, DB::select('SHOW DATABASES')));" 2>/dev/null |
+    grep -Ev '^(information_schema|mysql|performance_schema|sys|proactive_config|proactive-default|sharedStorage|sharedStorageTesting|spend-cloud|spend-cloud-config|keycloak|testing|testing_frame_dbunit|OCR|addresses)$' || true)"
+
+  printf '%s\n%s\n%s\n' "${folder_clients}" "${settings_clients}" "${db_clients}" |
     awk 'NF' | sort -u |
     grep -Ev '^(proactive_accounts\.ini|spend-cloud|oci)$' || true
 }
@@ -193,17 +199,18 @@ _nuke_analyze() {
   local container="${1}" target="${2}" settings_table="${3}"
   local client_id has_folder=0 has_settings=0 has_client_row=0 dbs
 
-  dbs="$(_nuke_sql "${container}" "SHOW DATABASES" |
-    grep -i "${target}" |
-    grep -Ev '^(information_schema|mysql|performance_schema|sys)$' || true)"
+  # Get databases matching the client name using Laravel tinker
+  # The result property is named after the query pattern, so we access it dynamically
+  dbs="$(docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${target}') === 0) { echo \$db . PHP_EOL; } }" 2>/dev/null | grep -v '^$' || true)"
 
   local folder_clients settings_clients
   folder_clients="$(docker exec "${container}" bash -lc 'ls -1 /data 2>/dev/null' || true)"
-  settings_clients="$(_nuke_sql "${container}" \
-    "SELECT DISTINCT \`043\` FROM ${settings_table} WHERE \`043\` IS NOT NULL AND \`043\` != ''" || true)"
+
+  # Check settings using tinker (case-insensitive)
+  settings_clients="$(docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$result = DB::connection('mysql_config')->table('${settings_table}')->whereRaw('LOWER(\`043\`) IS NOT NULL')->pluck('043'); echo implode(PHP_EOL, \$result->toArray());" 2>/dev/null || true)"
 
   echo "${folder_clients}" | grep -Fx "${target}" >/dev/null && has_folder=1
-  echo "${settings_clients}" | grep -Fx "${target}" >/dev/null && has_settings=1
+  echo "${settings_clients}" | grep -Fix "${target}" >/dev/null && has_settings=1
 
   _nuke_info "${C_CYAN}Analysis for '${target}':${C_RESET}" >&2
   printf '  - /data folder: %s\n' "$([[ ${has_folder} -eq 1 ]] && echo present || echo absent)" >&2
@@ -256,19 +263,35 @@ _nuke_execute() {
     local db
     while IFS= read -r db; do
       [[ -z "${db}" ]] && continue
+      # Validate database name doesn't contain dangerous characters
+      if [[ "${db}" =~ [\;\&\|\$\`] ]]; then
+        _nuke_warn "  - skipping unsafe db name: ${db}"
+        continue
+      fi
       _nuke_info "  - drop db ${db}"
-      _nuke_sql "${container}" "DROP DATABASE IF EXISTS \`${db}\`;" >/dev/null ||
+      # Use Laravel tinker for database operations since mysql command path issues
+      docker exec "${container}" php artisan tinker --execute="DB::statement('DROP DATABASE IF EXISTS \`${db}\`');" >/dev/null 2>&1 ||
         _nuke_warn "    (warn) drop failed ${db}"
     done <<<"${dbs}"
   fi
 
-  # Purge settings
+  # Purge settings (using Laravel tinker for database operations)
   ((has_settings == 1)) && {
     _nuke_info "  - purge ${settings_table}"
-    _nuke_sql "${container}" \
-      "DELETE FROM ${settings_table} WHERE LOWER(\`043\`)=LOWER('${target}')" >/dev/null ||
+    docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; DB::connection('mysql_config')->table('${settings_table}')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${target}')])->delete();" >/dev/null 2>&1 ||
       _nuke_warn "    (warn) purge failed"
   }
+
+  # Delete from client table to prevent Laravel from recreating the database
+  _nuke_info "  - remove from client registry"
+  local client_id_result
+  client_id_result="$(docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$client = DB::connection('mysql_config')->table('client')->where('naam', '${target}')->orWhereRaw('LOWER(naam) = ?', [strtolower('${target}')])->first(); if(\$client) { echo \$client->id; DB::connection('mysql_config')->table('client')->where('id', \$client->id)->delete(); }" 2>/dev/null)"
+
+  # Clean up all module settings tables (01_settings, 02_settings, etc.) if we found a client_id
+  if [[ -n "${client_id_result}" && "${client_id_result}" =~ ^[0-9]+$ ]]; then
+    _nuke_info "  - purge module settings (client_id: ${client_id_result})"
+    docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$tables = ['01_settings', '02_settings', '03_settings', '04_settings', '05_settings', '06_settings', '07_settings', '08_settings']; foreach(\$tables as \$table) { try { DB::connection('mysql_config')->table(\$table)->where('client_id', ${client_id_result})->delete(); } catch(\Exception \$e) {} }" >/dev/null 2>&1
+  fi
 
   # Remove data folder
   docker exec "${container}" test -d "/data/${target}" && {
@@ -277,7 +300,11 @@ _nuke_execute() {
       _nuke_warn "  - (warn) folder removal failed"
   }
 
-  _nuke_info "${C_GREEN}Done. Run: nuke --verify ${target}${C_RESET}"
+  _nuke_info "${C_GREEN}Done! Client '${target}' has been nuked.${C_RESET}"
+  echo ""
+  _nuke_info "Next steps:"
+  _nuke_info "  1. Verify cleanup: nuke --verify ${target}"
+  _nuke_info "  2. Reimport data: cluster-import --client ${target}"
 }
 
 #######################################
@@ -289,21 +316,52 @@ _nuke_help() {
   cat <<'EOF'
 Usage: nuke [--verify] [clientName]
   --verify | -v   Analyze only; no destructive actions
+  --force  | -f   Skip confirmation prompts (USE WITH CAUTION!)
   --help   | -h   Show this help
   clientName      Target client (if omitted, interactive selection)
+
 Environment vars:
-  DB_USERNAME (default: root)
-  DB_PASSWORD (default: <empty>)
-  DB_SERVICES_HOST (default: mysql-service)
-  NUKE_CONFIG_DB (default: spend-cloud-config)
+  ENABLE_NUKE=1   REQUIRED - Safety flag to enable nuke command
+  DB_USERNAME     Database user (default: root)
+  DB_PASSWORD     Database password (default: <empty>)
+  DB_SERVICES_HOST Database host (default: mysql-service)
+  NUKE_CONFIG_DB  Config database name (default: spend-cloud-config)
+
 Description:
-  Performs a destructive cleanup for a client across:
-    - config DB row(s) in settings tables
-    - 00_client row & related tables
-    - per-client databases
-    - /data/<client> folder
+  Performs a DESTRUCTIVE cleanup for a client across:
+    • Config DB row(s) in settings tables
+    • 00_client row & related tables
+    • Per-client databases
+    • /data/<client> folder
+
 Safety:
-  Dual confirmation; blacklist of protected names; verify mode.
+  • Requires ENABLE_NUKE=1 environment variable
+  • Dual confirmation prompts (can skip with --force)
+  • Blacklist of protected names (prod, production, etc.)
+  • Verify mode for safe inspection (--verify)
+
+Workflow:
+  1. Check what will be deleted:
+     → export ENABLE_NUKE=1
+     → nuke --verify sherpa
+
+  2. Delete and reimport:
+     → nuke sherpa
+     → cluster-import --client sherpa
+
+Common use cases:
+  • Corrupted database after failed migration
+  • Incomplete cluster import
+  • Testing with fresh data
+  • Removing old/unused clients
+
+⚠️  WARNING: This is DESTRUCTIVE and cannot be undone!
+    Always use --verify first to see what will be deleted.
+
+Examples:
+  nuke --verify sherpa          # Analyze sherpa without changes
+  nuke sherpa                   # Interactive delete with confirmations
+  ENABLE_NUKE=1 nuke --force sherpa  # Delete without prompts (DANGEROUS!)
 EOF
 }
 
@@ -336,7 +394,7 @@ nuke() {
   # Set defaults
   : "${DB_USERNAME:=root}" "${DB_PASSWORD:=}" "${DB_SERVICES_HOST:=mysql-service}" "${NUKE_CONFIG_DB:=spend-cloud-config}"
 
-  local mode="normal" target="" container settings_table="00_settings"
+  local mode="normal" target="" container settings_table="00_settings" force_mode=0
   local -r blacklist_regex='^(prod|production|shared|sharedstorage|system|default|oci)$'
 
   # Parse arguments
@@ -344,6 +402,10 @@ nuke() {
     case "${1}" in
     --verify | -v)
       mode="verify"
+      shift
+      ;;
+    --force | -f)
+      force_mode=1
       shift
       ;;
     --help | -h)
@@ -396,6 +458,15 @@ nuke() {
     }
   }
 
+  # Trim whitespace from target
+  target="${target// /}"
+
+  # Validate target is not empty after trimming
+  if [[ -z "${target}" ]]; then
+    _nuke_err "Invalid target: empty after trimming"
+    return 2
+  fi
+
   # Validate target
   [[ "${target}" =~ ${blacklist_regex} ]] && {
     _nuke_err "Target '${target}' is protected"
@@ -416,15 +487,20 @@ nuke() {
     return 0
   }
 
-  # Confirm destruction
-  _nuke_confirm "${C_YELLOW}Proceed to NUKE '${target}'? (yes/no) ${C_RESET}" 'yes' || {
-    _nuke_info "${C_GREEN}Aborted.${C_RESET}"
-    return 0
-  }
-  _nuke_confirm "${C_RED}Type the client name to confirm: ${C_RESET}" "${target}" || {
-    _nuke_info "${C_GREEN}Mismatch. Aborted.${C_RESET}"
-    return 1
-  }
+  # Skip confirmations in force mode
+  if ((force_mode == 1)); then
+    _nuke_warn "${C_YELLOW}⚠️  FORCE MODE: Skipping confirmations!${C_RESET}"
+  else
+    # Confirm destruction
+    _nuke_confirm "${C_YELLOW}Proceed to NUKE '${target}'? (yes/no) ${C_RESET}" 'yes' || {
+      _nuke_info "${C_GREEN}Aborted.${C_RESET}"
+      return 0
+    }
+    _nuke_confirm "${C_RED}Type the client name to confirm: ${C_RESET}" "${target}" || {
+      _nuke_info "${C_GREEN}Mismatch. Aborted.${C_RESET}"
+      return 1
+    }
+  fi
 
   # Execute destruction
   _nuke_execute "${container}" "${target}" "${settings_table}" "${analysis}"

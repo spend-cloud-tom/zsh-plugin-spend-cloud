@@ -129,6 +129,31 @@ _sc_require_command() {
 }
 
 #######################################
+# Check if Docker is running and accessible.
+# Outputs:
+#   Error message to stdout if Docker unavailable
+# Returns:
+#   0 if Docker is running, 1 otherwise
+#######################################
+_sc_check_docker() {
+  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
+  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
+  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
+
+  if ! command -v docker >/dev/null 2>&1; then
+    _sc_error "Docker is not installed. Please install Docker and try again."
+    return 1
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    _sc_error "Docker daemon is not running. Please start Docker and try again."
+    return 1
+  fi
+
+  return 0
+}
+
+#######################################
 # Find first running container matching a pattern.
 # Arguments:
 #   1 - Regex pattern to match container names

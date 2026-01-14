@@ -39,6 +39,12 @@ _migrate_get_container() {
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
+  # Check Docker availability first
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker daemon is not running. Please start Docker." >&2
+    return 1
+  fi
+
   _sc_find_container "${SC_API_CONTAINER_PATTERN}" || {
     echo "API container not found. Start with 'cluster'." >&2
     return 1
@@ -194,6 +200,45 @@ _migrate_debug() {
 }
 
 #######################################
+# Run Python migration healer if available.
+# Arguments:
+#   1 - Container name
+#   2 - Migration output
+# Outputs:
+#   Analysis report to stdout
+# Returns:
+#   0 always (analysis is optional)
+#######################################
+_migrate_run_healer() {
+  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
+  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
+  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
+
+  local container="${1}" output="${2}"
+
+  # Check if Python is available
+  if ! command -v python3 >/dev/null 2>&1; then
+    _sc_info "💡 Tip: Install Python 3 for detailed migration analysis"
+    return 0
+  fi
+
+  # Check if healer script exists
+  local healer_script="${SPEND_CLOUD_PLUGIN_DIR}/lib/migration-healer.py"
+  if [[ ! -f "${healer_script}" ]]; then
+    return 0
+  fi
+
+  # Run healer
+  _sc_info "🔍 Running migration dependency analysis..."
+  echo ""
+
+  # Debug: save output to temp file for inspection
+  echo "${output}" > /tmp/migrate_output_debug.txt
+
+  printf '%s' "${output}" | python3 "${healer_script}" "${container}"
+}
+
+#######################################
 # Run migrations with smart error handling.
 # Runs groups sequentially, continues on error, reports all failures.
 # Arguments:
@@ -216,7 +261,7 @@ _migrate_safe() {
   echo "Migration order: ${groups[*]}"
   echo ""
 
-  local group exit_code output
+  local group exit_code output full_output=""
   for group in "${groups[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     _sc_info "Group: ${group}"
@@ -225,6 +270,9 @@ _migrate_safe() {
     output=$(_migrate_exec "${container}" migrate-all --groups="${group}" 2>&1)
     exit_code=$?
     echo "${output}"
+
+    # Accumulate output for healer analysis
+    full_output+="${output}"$'\n'
 
     if ((exit_code != 0)); then
       # Check if error is due to missing table (known issue, not critical)
@@ -253,6 +301,12 @@ _migrate_safe() {
     _sc_warn "Migration completed with ${#warned_groups[@]} warning(s)"
     echo "Groups with warnings: ${warned_groups[*]}"
     _sc_info "These warnings are usually safe to ignore for existing databases"
+
+    # Run healer analysis if warnings were found
+    if echo "${full_output}" | grep -q "Base table or view not found"; then
+      _migrate_run_healer "${container}" "${full_output}"
+    fi
+
     return 0
   else
     _sc_success "All migration groups completed successfully!"
@@ -277,6 +331,13 @@ _migrate_fresh() {
     echo "Available groups: $(_migrate_get_groups)" >&2
     return 1
   }
+
+  # Validate group name to prevent injection
+  if [[ ! "${group}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    _sc_error "Invalid group name: ${group}"
+    return 1
+  fi
+
   _sc_warn "Running FRESH migrations for group: ${group}"
   _sc_warn "This will DROP existing tables for this group!"
   _migrate_exec "${container}" migrate:fresh --groups="${group}"
@@ -320,6 +381,13 @@ _migrate_retry() {
     echo "Available groups: $(_migrate_get_groups)" >&2
     return 1
   }
+
+  # Validate group name to prevent injection
+  if [[ ! "${group}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    _sc_error "Invalid group name: ${group}"
+    return 1
+  fi
+
   _sc_info "Retrying migrations for group: ${group} (with --force)"
   _migrate_exec "${container}" migrate-all --groups="${group}" --force
 }
@@ -425,6 +493,52 @@ _migrate_rollback_path() {
 }
 
 #######################################
+# Analyze last migration errors using Python healer.
+# Arguments:
+#   1 - Container name
+# Outputs:
+#   Analysis report to stdout
+# Returns:
+#   0 on success, 1 if Python unavailable
+#######################################
+_migrate_analyze() {
+  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
+  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
+  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
+
+  local container="${1}"
+
+  # Check if Python is available
+  if ! command -v python3 >/dev/null 2>&1; then
+    _sc_error "Python 3 is required for migration analysis"
+    echo ""
+    echo "Install Python 3:"
+    echo "  • Ubuntu/Debian: sudo apt install python3"
+    echo "  • macOS: brew install python3"
+    echo "  • Fedora: sudo dnf install python3"
+    return 1
+  fi
+
+  # Check if healer script exists
+  local healer_script="${SPEND_CLOUD_PLUGIN_DIR}/lib/migration-healer.py"
+  if [[ ! -f "${healer_script}" ]]; then
+    _sc_error "Migration healer script not found: ${healer_script}"
+    return 1
+  fi
+
+  _sc_info "🔍 Running comprehensive migration analysis..."
+  _sc_info "This will re-run migrations and analyze any errors..."
+  echo ""
+
+  # Run migrations and capture output
+  local output
+  output=$(_migrate_safe "${container}" 2>&1)
+
+  # Run healer with the output
+  printf '%s' "${output}" | python3 "${healer_script}" "${container}"
+}
+
+#######################################
 # Display migrate command usage.
 # Outputs:
 #   Help text to stdout
@@ -438,6 +552,10 @@ Modes:
   all        Run grouped migrate-all (stops on first error)
   debug      Run each group individually in sequence to isolate failures
   safe       Same as default - continues through all groups despite errors
+
+  analyze    🐍 Run Python-based migration dependency analysis
+             Provides detailed report of missing tables and suggests fixes
+             Requires: Python 3
 
   heal       🏥 Attempt to fix missing table issues automatically
              Runs pending migrations that may create missing tables
@@ -546,6 +664,7 @@ migrate() {
   safe | "") _migrate_safe "${container}" ;;
   all) _migrate_all "${container}" ;;
   debug | each) _migrate_debug "${container}" ;;
+  analyze) _migrate_analyze "${container}" ;;
   heal) _migrate_heal "${container}" ;;
   fresh) _migrate_fresh "${container}" "${2}" ;;
   retry) _migrate_retry "${container}" "${2}" ;;

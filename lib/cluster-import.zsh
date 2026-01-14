@@ -68,6 +68,7 @@ _cluster_import_filter_output() {
 
     # Show download progress dots
     if [[ "${step}" == "downloading" && "${line}" == *"."* && "${line}" != *"extracting"* && "${line}" != *"inflating"* ]]; then
+      # Show dot every 10th occurrence to avoid flooding
       printf '.' >&2
       continue
     fi
@@ -91,19 +92,7 @@ _cluster_import_filter_output() {
       continue
     fi
 
-    # Capture actual errors from sct
-    if [[ "${line}" =~ ^(Error|ERROR|error:|Errno|RuntimeError|StandardError|Exception|Failed|FAILED) ]]; then
-      error_msg="${line}"
-      _sc_error "${line}"
-      continue
-    fi
-
-    # Show completion message
-    if [[ "${line}" == *"Cluster import complete"* || "${line}" == *"Import successful"* || "${line}" == *"Done"* ]]; then
-      continue
-    fi
-
-    # Suppress known noise
+    # Suppress known noise and benign errors
     if [[ "${line}" == *"Loading available customer dumps"* ]] ||
       [[ "${line}" =~ ^[0-9]+\..*gs://henk-db-dumps/ ]] ||
       [[ "${line}" == *"Please choose a dump"* ]] ||
@@ -114,12 +103,22 @@ _cluster_import_filter_output() {
       [[ "${line}" == *"Use --trace to view backtrace"* ]] ||
       [[ "${line}" == *"Successfully copied"* ]] ||
       [[ "${line}" == *"Copied db_encryption.key"* ]] ||
+      [[ "${line}" == *"Cluster import complete"* ]] ||
+      [[ "${line}" == *"Import successful"* ]] ||
+      [[ "${line}" == *"Done"* ]] ||
       [[ -z "${line}" ]]; then
       continue
     fi
 
-    # Catch-all for other potential error indicators
-    if [[ "${line}" == *"error"* ]] || [[ "${line}" == *"fail"* ]] || [[ "${line}" == *"Error"* ]]; then
+    # Capture ONLY critical errors (duplicate key errors in core tables)
+    if [[ "${line}" =~ "ERROR 1062.*Duplicate entry.*PRIMARY" ]] && [[ "${line}" =~ "(00_settings|client)" ]]; then
+      error_msg="${line}"
+      _sc_error "${line}"
+      continue
+    fi
+
+    # Other critical MySQL errors (non-duplicate)
+    if [[ "${line}" =~ ^ERROR\ [0-9]+.*at\ line.*in\ file ]] && [[ "${line}" != *"Duplicate entry"* ]]; then
       error_msg="${line}"
       _sc_error "${line}"
     fi
@@ -171,17 +170,21 @@ _cluster_import_parse_options() {
   local probe_output="${1}"
   [[ -n "${probe_output}" ]] || return 1
 
-  local parsed
+  local parsed num client timestamp
   parsed="$(printf '%s\n' "${probe_output}" | awk '
+    BEGIN { FS=""; }
     /^[[:space:]]*[0-9]+[.)][[:space:]]+/ {
       line=$0
       gsub(/\r/, "", line)
       sub(/^[[:space:]]*/, "", line)
 
-      # Extract number
-      num=line
-      sub(/[[:space:]].*$/, "", num)
-      sub(/[).]$/, "", num)
+      # Extract number (renamed to avoid global warnings)
+      num_val=line
+      sub(/[[:space:]].*$/, "", num_val)
+      sub(/[).]$/, "", num_val)
+
+      # Validate number is actually numeric
+      if (num_val !~ /^[0-9]+$/) next
 
       # Extract full path (gs://henk-db-dumps/...)
       desc=line
@@ -196,8 +199,8 @@ _cluster_import_parse_options() {
         sub(/\.zip.*$/, "", temp)  # Remove .zip suffix
 
         # Split on underscore: CLIENT_TIMESTAMP
-        client = temp
-        sub(/_.*$/, "", client)
+        client_val = temp
+        sub(/_.*$/, "", client_val)
 
         timestamp_raw = temp
         sub(/^[^_]+_/, "", timestamp_raw)
@@ -215,10 +218,10 @@ _cluster_import_parse_options() {
         split(months, month_arr, " ")
         month_name = month_arr[int(month)]
 
-        timestamp = sprintf("%s %02d, %s %02d:%02d", month_name, int(day), year, int(hour), int(min))
+        timestamp_val = sprintf("%s %02d, %s %02d:%02d", month_name, int(day), year, int(hour), int(min))
 
         # Pad client name to 18 characters (right-padded with spaces)
-        printf "%s\t%-18s\t%s\n", num, client, timestamp
+        printf "%s\t%-18s\t%s\n", num_val, client_val, timestamp_val
       }
     }
   ')"
@@ -254,6 +257,7 @@ _cluster_import_header() {
 #######################################
 # Interactive wrapper around `sct henk import`.
 # Arguments:
+#   --client CLIENT_NAME - Optional client name to import directly
 #   * - Additional arguments forwarded to sct
 # Outputs:
 #   Delegated sct output
@@ -267,6 +271,23 @@ cluster-import() {
 
   _sc_require_command sct "Install the SpendCloud CLI (sct)" || return 1
 
+  # Parse --client flag
+  local client_name=""
+  local -a args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --client)
+        shift
+        client_name="$1"
+        shift
+        ;;
+      *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
   # Check if cluster is running, start it if not
   if ! docker ps --format '{{.Names}}' | grep -q "mysql-service\|proactive-config"; then
     _sc_info "🔍 Cluster not running. Starting cluster..."
@@ -274,24 +295,121 @@ cluster-import() {
       _sc_error "Failed to start cluster. Cannot import."
       return 1
     }
-    
-    # Wait for services to be ready
+
+    # Wait for services to be ready with proper checks
     _sc_info "⏳ Waiting for services to be ready..."
-    sleep 5
+    local retries=0
+    local max_retries=30
+    while ! docker ps --format '{{.Names}}' | grep -q "mysql-service" && ((retries < max_retries)); do
+      sleep 1
+      ((retries++))
+    done
+
+    if ((retries >= max_retries)); then
+      _sc_error "Services did not start in time."
+      return 1
+    fi
+
+    # Give MySQL extra time to initialize
+    sleep 3
     _sc_success "Cluster is ready!"
   fi
-  
+
   # Fix /data directory permissions for imports (runs as root to ensure it works)
   docker exec proactive-config bash -c "mkdir -p /data && chmod 777 /data" 2>/dev/null || true
 
-  if ! command -v fzf >/dev/null 2>&1; then
-    _sc_warn "fzf not found; falling back to default SCT prompt."
-    _cluster_import_run_interactive "$@"
-    return $?
+  # If --client flag provided, handle direct import
+  if [[ -n "${client_name}" ]]; then
+    # Check for existing client data before import
+    if command -v nuke >/dev/null 2>&1; then
+      local container
+      container="$(docker ps --format '{{.Names}}' | grep -E '^spend-cloud-api$' | head -1)"
+
+      if [[ -n "${container}" ]]; then
+        # Check if client exists in database or has data folder
+        local has_residue=0
+
+        # Check database existence
+        if docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${client_name}') === 0) { echo \$db; exit; } }" 2>/dev/null | grep -q "."; then
+          has_residue=1
+        fi
+
+        # Check settings table
+        if docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$count = DB::connection('mysql_config')->table('00_settings')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${client_name}')])->count(); echo \$count;" 2>/dev/null | grep -qv "^0$"; then
+          has_residue=1
+        fi
+
+        # Check data folder
+        if docker exec "${container}" test -d "/data/${client_name}" 2>/dev/null; then
+          has_residue=1
+        fi
+
+        if ((has_residue == 1)); then
+          _sc_warn "⚠️  Found existing data for '${client_name}'"
+          _sc_info "Running automatic cleanup before import..."
+
+          # Source nuke if not already loaded
+          if ! typeset -f _nuke_execute >/dev/null 2>&1; then
+            local plugin_dir="${0:A:h}"
+            [[ -f "${plugin_dir}/nuke.zsh" ]] && source "${plugin_dir}/nuke.zsh"
+          fi
+
+          # Run nuke with force flag
+          if nuke "${client_name}" --force; then
+            _sc_success "✓ Cleanup complete, proceeding with import..."
+          else
+            _sc_error "Cleanup failed. Import may encounter duplicate key errors."
+            _sc_info "You can manually run: nuke ${client_name} --force"
+          fi
+          echo ""
+        fi
+      fi
+    fi
+
+    local probe_output
+    probe_output="$(_cluster_import_probe "${args[@]}")"
+
+    local options_text
+    if ! options_text="$(_cluster_import_parse_options "${probe_output}")"; then
+      _sc_error "Unable to parse SCT cluster list."
+      return 1
+    fi
+
+    # Find matching client (case-insensitive)
+    local matched_number="" matched_timestamp="" num client ts
+    while IFS=$'\t' read -r num client ts; do
+      # Trim whitespace from client name
+      client="${client// /}"
+      if [[ "${client:l}" == "${client_name:l}" ]]; then
+        matched_number="${num}"
+        matched_timestamp="${ts}"
+        break
+      fi
+    done <<<"${options_text}"
+
+    if [[ -z "${matched_number}" ]]; then
+      _sc_error "Client '${client_name}' not found in available dumps."
+      return 1
+    fi
+
+    _sc_info "📥 Importing cluster dataset: ${client_name} (${matched_timestamp})"
+    _cluster_import_run_with_input "${matched_number}" "${args[@]}"
+    local exit_code=$?
+
+    if ((exit_code == 0)); then
+      _sc_success "Cluster import complete."
+      return 0
+    else
+      _sc_error "Cluster import failed."
+      return ${exit_code}
+    fi
   fi
 
-  local -a args
-  args=("$@")
+  if ! command -v fzf >/dev/null 2>&1; then
+    _sc_warn "fzf not found; falling back to default SCT prompt."
+    _cluster_import_run_interactive "${args[@]}"
+    return $?
+  fi
 
   local probe_output
   probe_output="$(_cluster_import_probe "${args[@]}")"

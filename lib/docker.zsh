@@ -16,6 +16,11 @@ _sc_list_dev_containers() {
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
+  # Check Docker first to avoid errors
+  if ! docker info >/dev/null 2>&1; then
+    return 0
+  fi
+
   docker ps -a --format "{{.Names}}" | grep -E "${SC_DEV_CONTAINER_PATTERN}" 2>/dev/null || true
 }
 
@@ -102,10 +107,24 @@ _sc_start_dev_service() {
   (
     cd "${service_dir}" || exit 1
     nohup sct dev >>"${SC_DEV_LOG_DIR}/${log_prefix}.log" 2>&1 &
+    echo $! > "${SC_DEV_LOG_DIR}/${log_prefix}.pid"
   ) || {
     _sc_error "Failed to start dev in ${service_dir}"
     return 1
   }
+
+  # Give the process a moment to start
+  sleep 1
+
+  # Verify the process is still running
+  if [[ -f "${SC_DEV_LOG_DIR}/${log_prefix}.pid" ]]; then
+    local pid
+    pid="$(cat "${SC_DEV_LOG_DIR}/${log_prefix}.pid")"
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      _sc_error "Dev service failed to start (process died immediately)"
+      return 1
+    fi
+  fi
 }
 
 #######################################
