@@ -99,7 +99,6 @@ _cluster_import_filter_output() {
       [[ "${line}" == *"Copying gs://"* ]] ||
       [[ "${line}" == *"Average throughput"* ]] ||
       [[ "${line}" == *"the input device is not a TTY"* ]] ||
-      [[ "${line}" == *"error: docker exec -it mysql-service"* ]] ||
       [[ "${line}" == *"Use --trace to view backtrace"* ]] ||
       [[ "${line}" == *"Successfully copied"* ]] ||
       [[ "${line}" == *"Copied db_encryption.key"* ]] ||
@@ -212,17 +211,78 @@ _cluster_import_parse_options() {
         day = dt[3]
         hour = dt[4]
         min = dt[5]
+        sec = dt[6]
 
-        # Format as human-readable: "Sep 30, 2025 11:00"
-        months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec"
-        split(months, month_arr, " ")
-        month_name = month_arr[int(month)]
+        # Compute epoch seconds for sorting (use GNU date)
+        epoch_cmd = sprintf("date -d \"%04d-%02d-%02d %02d:%02d:%02d\" +%%s 2>/dev/null || echo 0", year, month, day, hour, min, sec)
+        epoch_cmd | getline epoch_val
+        close(epoch_cmd)
 
-        timestamp_val = sprintf("%s %02d, %s %02d:%02d", month_name, int(day), year, int(hour), int(min))
-
-        # Pad client name to 18 characters (right-padded with spaces)
-        printf "%s\t%-18s\t%s\n", num_val, client_val, timestamp_val
+        # Store as sortable record: epoch, num, client, timestamp_raw
+        printf "%s\t%s\t%-18s\t%s\n", epoch_val, num_val, client_val, timestamp_raw
       }
+    }
+  ' | sort -t$'\t' -k1,1nr | awk -F'\t' '
+    BEGIN {
+      # Get current time
+      cmd = "date +%s"
+      cmd | getline now
+      close(cmd)
+
+      months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec"
+      split(months, month_arr, " ")
+    }
+    {
+      epoch = $1
+      num = $2
+      client = $3
+      timestamp_raw = $4
+
+      # Parse timestamp_raw: YYYY-MM-DDTHH:MM:SS
+      split(timestamp_raw, dt, /[-T:]/)
+      year = dt[1]
+      month = dt[2]
+      day = dt[3]
+      hour = dt[4]
+      min = dt[5]
+
+      # Calculate relative time
+      diff = now - epoch
+      days_diff = int(diff / 86400)
+
+      if (days_diff == 0) {
+        # Today
+        hours_diff = int(diff / 3600)
+        if (hours_diff == 0) {
+          mins_diff = int(diff / 60)
+          if (mins_diff == 0) {
+            rel = "just now"
+          } else if (mins_diff == 1) {
+            rel = "1 minute ago"
+          } else {
+            rel = sprintf("%d minutes ago", mins_diff)
+          }
+        } else if (hours_diff == 1) {
+          rel = "1 hour ago"
+        } else {
+          rel = sprintf("%d hours ago", hours_diff)
+        }
+      } else if (days_diff == 1) {
+        rel = "yesterday"
+      } else if (days_diff < 7) {
+        rel = sprintf("%d days ago", days_diff)
+      } else if (days_diff < 14) {
+        rel = "1 week ago"
+      } else if (days_diff < 30) {
+        weeks = int(days_diff / 7)
+        rel = sprintf("%d weeks ago", weeks)
+      } else {
+        # Fallback to absolute date
+        month_name = month_arr[int(month)]
+        rel = sprintf("%s %d, %s", month_name, int(day), year)
+      }
+
+      printf "%s\t%-18s\t%s\n", num, client, rel
     }
   ')"
 
@@ -329,13 +389,13 @@ cluster-import() {
         # Check if client exists in database or has data folder
         local has_residue=0
 
-        # Check database existence
-        if docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${client_name}') === 0) { echo \$db; exit; } }" 2>/dev/null | grep -q "."; then
+        # Check database existence (ignore errors - residue checks are best-effort)
+        if docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${client_name}') === 0) { echo \$db; exit; } }" 2>&1 | grep -qv "error:" | grep -q "."; then
           has_residue=1
         fi
 
-        # Check settings table
-        if docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$count = DB::connection('mysql_config')->table('00_settings')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${client_name}')])->count(); echo \$count;" 2>/dev/null | grep -qv "^0$"; then
+        # Check settings table (ignore errors - residue checks are best-effort)
+        if docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$count = DB::connection('mysql_config')->table('00_settings')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${client_name}')])->count(); echo \$count;" 2>&1 | grep -qv "error:" | grep -qv "^0$"; then
           has_residue=1
         fi
 
