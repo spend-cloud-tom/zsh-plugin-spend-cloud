@@ -16,9 +16,9 @@ This plugin wraps common workflows around the SpendCloud CLI (`sct`) and the loc
 - **`nuke`**: destructive client cleanup (gated by `ENABLE_NUKE=1`) to remove databases/config rows/files for a client
 - **`spend-cloud`**: interactive command hub
 
-## Why it’s useful
+## Why it's useful
 
-- Reduces repetitive “glue” commands across Docker, `sct`, and Laravel artisan
+- Reduces repetitive "glue" commands across Docker, `sct`, and Laravel artisan
 - Makes migration failures easier to understand (and faster to fix)
 - Provides a safer, more complete cleanup path when a customer environment is corrupted
 
@@ -77,6 +77,30 @@ source /path/to/zsh-plugin-spend-cloud/spend-cloud.plugin.zsh
 
 - `NO_COLOR=1`: disable colored output
 
+**IDE / editor aliases** (`capi`, `cui`, `cpf`)
+
+These aliases open project directories in your preferred editor. They follow the standard Unix editor resolution chain:
+
+1. `$VISUAL` — checked first (intended for full-screen/GUI editors per POSIX)
+2. `$EDITOR` — fallback (general editor preference)
+3. `code` — final fallback for backwards compatibility
+
+Set either variable in your shell config to use your preferred IDE:
+
+```zsh
+# GoLand
+export VISUAL="goland"
+
+# Cursor
+export VISUAL="cursor"
+
+# Zed
+export VISUAL="zed"
+
+# VS Code (default, no config needed)
+# export VISUAL="code"
+```
+
 **Migrations**
 - `MIGRATION_GROUP_ORDER="proactive_config,proactive-default,sharedStorage,customers"`: override group order
 
@@ -128,7 +152,7 @@ Direct import:
 cluster-import --client watermeloen
 ```
 
-If the target client has “residue” (existing DB/config rows/files), `cluster-import --client ...` will attempt a cleanup via `nuke --force` **if** `nuke` is available and `ENABLE_NUKE=1` is set.
+If the target client has "residue" (existing DB/config rows/files), `cluster-import --client ...` will attempt a cleanup via `nuke --force` **if** `nuke` is available and `ENABLE_NUKE=1` is set.
 
 ### Run migrations
 
