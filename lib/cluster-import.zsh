@@ -1,317 +1,225 @@
 #!/usr/bin/env zsh
 #
 # Cluster import command for SpendCloud plugin.
+#
+# IMPORTANT - why this file never pipes stdin:
+#   `sct henk import` shells out to `gcloud storage`, and gcloud will only run
+#   its reauthentication challenge when BOTH stdin and stderr are TTYs
+#   (googlecloudsdk/core/console/console_io.py: CanPrompt -> IsInteractive).
+#   Feeding sct a here-string/pipe, or folding stderr into a pipe with `2>&1`,
+#   turns an ordinary "Reauthentication required. Please enter your password:"
+#   prompt into a hard failure:
+#     ERROR: (gcloud.storage.ls) There was a problem refreshing your current
+#     auth tokens: Reauthentication failed. cannot prompt during
+#     non-interactive execution.
+#   The same applies to the `docker exec -it` that `sct henk list-clients` runs.
+#   So: capture stdout if you must, but leave stdin and stderr on the terminal.
+
+# Bucket holding the customer database dumps.
+if [[ -z "${SC_HENK_DUMP_BUCKET:-}" ]]; then
+  typeset -g SC_HENK_DUMP_BUCKET="gs://henk-db-dumps"
+fi
 
 #######################################
-# Run cluster import with predefined input and filtered output.
-# Arguments:
-#   1 - Input line to send to sct (string)
-#   2+ - Additional arguments forwarded to sct
+# List available dumps straight from GCS.
+# Only stdout is captured; stdin and stderr stay attached to the terminal so
+# gcloud can prompt for reauthentication and surface its own errors.
 # Outputs:
-#   Filtered progress messages
+#   One gs:// URL per line
 # Returns:
-#   Exit status from sct command
+#   0 on success, 1 if gcloud failed (auth, network, permissions, ...)
 #######################################
-_cluster_import_run_with_input() {
+_cluster_import_list_dumps() {
   emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
-  local input="${1}"
-  shift
-  printf '%s\n' "${input}" | sct henk import "$@" 2>&1 | _cluster_import_filter_output
-  return ${PIPESTATUS[1]}
+  local listing
+  listing="$(gcloud storage ls "${SC_HENK_DUMP_BUCKET}/")" || return 1
+
+  printf '%s\n' "${listing//$'\r'/}"
 }
 
 #######################################
-# Run interactive cluster import.
+# Turn raw gs:// URLs into sorted, human readable selection rows.
 # Arguments:
-#   * - Additional arguments forwarded to sct
+#   1 - Raw listing (one gs:// URL per line)
 # Outputs:
-#   Delegated command output
+#   Tab separated rows, newest first: "URL<TAB>CLIENT<TAB>RELATIVE_TIME"
 # Returns:
-#   Exit status from sct command
+#   0 on success, 1 if nothing parseable was found
 #######################################
-_cluster_import_run_interactive() {
+_cluster_import_format_dumps() {
   emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
-  sct henk import "$@"
+  local listing="${1}"
+  [[ -n "${listing}" ]] || return 1
+
+  local formatted
+  formatted="$(printf '%s\n' "${listing}" | awk '
+    BEGIN {
+      cmd = "date +%s"; cmd | getline now; close(cmd)
+      split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", month_arr, " ")
+    }
+    {
+      line = $0
+      gsub(/\r/, "", line)
+      if (line !~ /\.zip$/) next
+
+      base = line
+      sub(/.*\//, "", base)
+      sub(/\.zip$/, "", base)
+
+      # Split on the LAST underscore: client names may contain underscores,
+      # the ISO-8601 timestamp never does.
+      cut = 0
+      for (j = length(base); j > 0; j--) {
+        if (substr(base, j, 1) == "_") { cut = j; break }
+      }
+      if (cut == 0) next
+
+      client = substr(base, 1, cut - 1)
+      ts     = substr(base, cut + 1)
+      if (ts !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) next
+
+      split(ts, dt, /[-T:]/)
+      epoch = 0
+      epoch_cmd = sprintf("date -d \"%s-%s-%s %s:%s:%s\" +%%s 2>/dev/null || echo 0", dt[1], dt[2], dt[3], dt[4], dt[5], dt[6])
+      epoch_cmd | getline epoch
+      close(epoch_cmd)
+
+      diff = now - epoch
+      days = int(diff / 86400)
+
+      if (epoch == 0) {
+        rel = ts
+      } else if (days == 0) {
+        hours = int(diff / 3600)
+        if (hours == 0) {
+          mins = int(diff / 60)
+          if (mins <= 0)       rel = "just now"
+          else if (mins == 1)  rel = "1 minute ago"
+          else                 rel = sprintf("%d minutes ago", mins)
+        }
+        else if (hours == 1)   rel = "1 hour ago"
+        else                   rel = sprintf("%d hours ago", hours)
+      }
+      else if (days == 1)      rel = "yesterday"
+      else if (days < 7)       rel = sprintf("%d days ago", days)
+      else if (days < 14)      rel = "1 week ago"
+      else if (days < 30)      rel = sprintf("%d weeks ago", int(days / 7))
+      else                     rel = sprintf("%s %d, %s", month_arr[int(dt[2])], int(dt[3]), dt[1])
+
+      printf "%s\t%s\t%s\t%s\n", epoch, line, client, rel
+    }
+  ' | sort -t$'\t' -k1,1nr | cut -f2-)"
+
+  [[ -n "${formatted}" ]] || return 1
+  printf '%s\n' "${formatted}"
 }
 
 #######################################
-# Filter and format sct henk import output for clean display.
+# Format sct henk import output for clean display.
+# Only sct's stdout is piped in; stderr stays on the terminal (see file header),
+# so gcloud/unzip progress and prompts are shown raw and unfiltered.
+# Unrecognised lines are passed through rather than swallowed, so a failing
+# import is never silent.
 # Inputs:
-#   Raw sct output from stdin
+#   sct stdout from stdin
 # Outputs:
-#   Filtered progress messages to stdout
+#   Formatted progress messages
 # Returns:
-#   0 on success, 1 if errors detected
+#   0 on success, 1 if an error line was seen
 #######################################
 _cluster_import_filter_output() {
   emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
-  local line step="downloading" client_name="" error_msg=""
+  local line client_name="" saw_error=0
+  local step=""
 
   while IFS= read -r line; do
-    # Extract client name from import line
-    if [[ "${line}" == *"Going to import gs://henk-db-dumps/"* ]]; then
-      client_name="${line#*henk-db-dumps/}"
-      client_name="${client_name%%_*}"
-      _sc_info "📦 Downloading ${client_name} database dump..."
-      step="downloading"
-      continue
-    fi
+    # Strip ANSI colours sct emits, so matching is reliable.
+    line="${line//$'\r'/}"
+    local plain="${line//$'\033'\[[0-9;]#m/}"
 
-    # Show download progress dots
-    if [[ "${step}" == "downloading" && "${line}" == *"."* && "${line}" != *"extracting"* && "${line}" != *"inflating"* ]]; then
-      # Show dot every 10th occurrence to avoid flooding
-      printf '.' >&2
-      continue
-    fi
+    case "${plain}" in
+      *"Going to import "*)
+        client_name="${plain##*/}"
+        client_name="${client_name%_*}"
+        _sc_info "📦 Downloading ${client_name} database dump..."
+        continue
+        ;;
+      "Archive:"*|*" inflating:"*|*" extracting:"*)
+        if [[ "${step}" != "extracting" ]]; then
+          _sc_info "📂 Extracting database files..."
+          step="extracting"
+        fi
+        continue
+        ;;
+      "Running "*.sql*)
+        if [[ "${step}" != "importing" ]]; then
+          _sc_info "💾 Importing database (this may take a while)..."
+          step="importing"
+        fi
+        # Keep the per-file "(3/12)" progress, it is the only sign of life.
+        _sc_print "${C_BLUE}" "   ${plain}"
+        continue
+        ;;
+      *"Customer already exists"*|"Dropping database"*|"Removing customer"*|"Finding client_id"*|"  Deleting from"*|"  Cleaning up"*)
+        _sc_print "${C_BLUE}" "   ${plain}"
+        continue
+        ;;
+      "Finished importing "*)
+        _sc_success "${plain}"
+        continue
+        ;;
+      "Loading available customer dumps"*|"Copying gs://"*|*"Average throughput"*|*"Successfully copied"*|"")
+        continue
+        ;;
+      ERROR*|*"ERROR "[0-9]*)
+        saw_error=1
+        _sc_error "${plain}"
+        continue
+        ;;
+    esac
 
-    # Transition to extraction
-    if [[ "${line}" == *"Archive:"* || "${line}" == *"extracting"* || "${line}" == *"inflating"* ]]; then
-      if [[ "${step}" == "downloading" ]]; then
-        printf '\n' >&2
-        _sc_info "📂 Extracting database files..."
-        step="extracting"
-      fi
-      continue
-    fi
-
-    # Transition to import
-    if [[ "${line}" == *"Running "*.sql* ]]; then
-      if [[ "${step}" != "importing" ]]; then
-        _sc_info "💾 Importing database (this may take a while)..."
-        step="importing"
-      fi
-      continue
-    fi
-
-    # Suppress known noise and benign errors
-    if [[ "${line}" == *"Loading available customer dumps"* ]] ||
-      [[ "${line}" =~ ^[0-9]+\..*gs://henk-db-dumps/ ]] ||
-      [[ "${line}" == *"Please choose a dump"* ]] ||
-      [[ "${line}" == *"Copying gs://"* ]] ||
-      [[ "${line}" == *"Average throughput"* ]] ||
-      [[ "${line}" == *"the input device is not a TTY"* ]] ||
-      [[ "${line}" == *"Use --trace to view backtrace"* ]] ||
-      [[ "${line}" == *"Successfully copied"* ]] ||
-      [[ "${line}" == *"Copied db_encryption.key"* ]] ||
-      [[ "${line}" == *"Cluster import complete"* ]] ||
-      [[ "${line}" == *"Import successful"* ]] ||
-      [[ "${line}" == *"Done"* ]] ||
-      [[ -z "${line}" ]]; then
-      continue
-    fi
-
-    # Capture ONLY critical errors (duplicate key errors in core tables)
-    if [[ "${line}" =~ "ERROR 1062.*Duplicate entry.*PRIMARY" ]] && [[ "${line}" =~ "(00_settings|client)" ]]; then
-      error_msg="${line}"
-      _sc_error "${line}"
-      continue
-    fi
-
-    # Other critical MySQL errors (non-duplicate)
-    if [[ "${line}" =~ ^ERROR\ [0-9]+.*at\ line.*in\ file ]] && [[ "${line}" != *"Duplicate entry"* ]]; then
-      error_msg="${line}"
-      _sc_error "${line}"
-    fi
+    # Anything unrecognised is shown as-is. Silence here is what made a broken
+    # import look like a successful one.
+    printf '%s\n' "${line}"
   done
 
-  # Final newline if we were showing dots
-  [[ "${step}" == "downloading" ]] && printf '\n' >&2
-
-  # Return error message for caller to use
-  [[ -n "${error_msg}" ]] && return 1 || return 0
+  return ${saw_error}
 }
 
 #######################################
-# Probe sct for available cluster import targets.
+# Run the actual import for a dump URL.
+# stdin and stderr are deliberately left on the terminal (see file header).
 # Arguments:
-#   * - Additional arguments forwarded to sct
-# Outputs:
-#   Raw sct stdout/stderr (with carriage returns removed)
+#   1 - gs:// dump URL
+#   2+ - Additional arguments forwarded to sct
 # Returns:
-#   Always 0 (errors are handled by caller)
+#   sct's exit status, or 1 if the output filter saw an error
 #######################################
-_cluster_import_probe() {
+_cluster_import_run() {
   emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
   setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
-  local -a args
-  args=("$@")
-  local sentinel="__cluster_wrapper_probe__" output
+  local url="${1}"
+  shift
 
-  # Use raw sct output for probing, bypass the filter
-  output="$(printf '%s\n' "${sentinel}" | sct henk import "${args[@]}" 2>&1 || true)"
-  output="${output//$'\r'/}"
-  printf '%s\n' "${output}"
-}
+  local -a status_list
+  sct henk import "$@" "${url}" | _cluster_import_filter_output
+  # NOTE: zsh populates `pipestatus`, not bash's `PIPESTATUS`. Using the latter
+  # silently returned the *filter's* status and reported failed imports as OK.
+  status_list=("${pipestatus[@]}")
 
-#######################################
-# Extract numbered options from sct probe output.
-# Outputs:
-#   Tab-separated option lines: "NUMBER<TAB>CLIENT_NAME<TAB>TIMESTAMP"
-# Returns:
-#   0 on success, 1 if no options found
-#######################################
-_cluster_import_parse_options() {
-  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
-  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
-  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
-
-  local probe_output="${1}"
-  [[ -n "${probe_output}" ]] || return 1
-
-  local parsed num client timestamp
-  parsed="$(printf '%s\n' "${probe_output}" | awk '
-    BEGIN { FS=""; }
-    /^[[:space:]]*[0-9]+[.)][[:space:]]+/ {
-      line=$0
-      gsub(/\r/, "", line)
-      sub(/^[[:space:]]*/, "", line)
-
-      # Extract number (renamed to avoid global warnings)
-      num_val=line
-      sub(/[[:space:]].*$/, "", num_val)
-      sub(/[).]$/, "", num_val)
-
-      # Validate number is actually numeric
-      if (num_val !~ /^[0-9]+$/) next
-
-      # Extract full path (gs://henk-db-dumps/...)
-      desc=line
-      sub(/^[0-9]+[.)][[:space:]]+/, "", desc)
-
-      # Parse client name and timestamp from path
-      # Format: gs://henk-db-dumps/CLIENT_YYYY-MM-DDTHH:MM:SS.zip
-      if (match(desc, /\/[^_]+_[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.zip/)) {
-        # Extract components using sub/gsub
-        temp = desc
-        sub(/.*\//, "", temp)  # Remove path prefix
-        sub(/\.zip.*$/, "", temp)  # Remove .zip suffix
-
-        # Split on underscore: CLIENT_TIMESTAMP
-        client_val = temp
-        sub(/_.*$/, "", client_val)
-
-        timestamp_raw = temp
-        sub(/^[^_]+_/, "", timestamp_raw)
-
-        # Parse YYYY-MM-DDTHH:MM:SS
-        split(timestamp_raw, dt, /[-T:]/)
-        year = dt[1]
-        month = dt[2]
-        day = dt[3]
-        hour = dt[4]
-        min = dt[5]
-        sec = dt[6]
-
-        # Compute epoch seconds for sorting (use GNU date)
-        epoch_cmd = sprintf("date -d \"%04d-%02d-%02d %02d:%02d:%02d\" +%%s 2>/dev/null || echo 0", year, month, day, hour, min, sec)
-        epoch_cmd | getline epoch_val
-        close(epoch_cmd)
-
-        # Store as sortable record: epoch, num, client, timestamp_raw
-        printf "%s\t%s\t%-18s\t%s\n", epoch_val, num_val, client_val, timestamp_raw
-      }
-    }
-  ' | sort -t$'\t' -k1,1nr | awk -F'\t' '
-    BEGIN {
-      # Get current time
-      cmd = "date +%s"
-      cmd | getline now
-      close(cmd)
-
-      months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec"
-      split(months, month_arr, " ")
-    }
-    {
-      epoch = $1
-      num = $2
-      client = $3
-      timestamp_raw = $4
-
-      # Parse timestamp_raw: YYYY-MM-DDTHH:MM:SS
-      split(timestamp_raw, dt, /[-T:]/)
-      year = dt[1]
-      month = dt[2]
-      day = dt[3]
-      hour = dt[4]
-      min = dt[5]
-
-      # Calculate relative time
-      diff = now - epoch
-      days_diff = int(diff / 86400)
-
-      if (days_diff == 0) {
-        # Today
-        hours_diff = int(diff / 3600)
-        if (hours_diff == 0) {
-          mins_diff = int(diff / 60)
-          if (mins_diff == 0) {
-            rel = "just now"
-          } else if (mins_diff == 1) {
-            rel = "1 minute ago"
-          } else {
-            rel = sprintf("%d minutes ago", mins_diff)
-          }
-        } else if (hours_diff == 1) {
-          rel = "1 hour ago"
-        } else {
-          rel = sprintf("%d hours ago", hours_diff)
-        }
-      } else if (days_diff == 1) {
-        rel = "yesterday"
-      } else if (days_diff < 7) {
-        rel = sprintf("%d days ago", days_diff)
-      } else if (days_diff < 14) {
-        rel = "1 week ago"
-      } else if (days_diff < 30) {
-        weeks = int(days_diff / 7)
-        rel = sprintf("%d weeks ago", weeks)
-      } else {
-        # Fallback to absolute date
-        month_name = month_arr[int(month)]
-        rel = sprintf("%s %d, %s", month_name, int(day), year)
-      }
-
-      printf "%s\t%-18s\t%s\n", num, client, rel
-    }
-  ')"
-
-  [[ -n "${parsed}" ]] || return 1
-  printf '%s\n' "${parsed}"
-}
-
-#######################################
-# Extract header line from probe output for display.
-# Outputs:
-#   First non-empty, non-option line (if any)
-# Returns:
-#   0 always
-#######################################
-_cluster_import_header() {
-  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
-  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
-  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
-
-  local probe_output="${1}"
-  [[ -n "${probe_output}" ]] || return 0
-
-  printf '%s\n' "${probe_output}" | awk '
-    /^[[:space:]]*[0-9]+[.)][[:space:]]+/ { next }
-    /^[[:space:]]*$/ { next }
-    /__cluster_wrapper_probe__/ { next }
-    /Invalid selection/ { next }
-    { print; exit }
-  '
+  (( status_list[1] != 0 )) && return ${status_list[1]}
+  return ${status_list[2]}
 }
 
 #######################################
@@ -330,6 +238,7 @@ cluster-import() {
   local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
 
   _sc_require_command sct "Install the SpendCloud CLI (sct)" || return 1
+  _sc_require_command gcloud "Install the Google Cloud SDK" || return 1
 
   # Parse --client flag
   local client_name=""
@@ -378,9 +287,9 @@ cluster-import() {
   # Fix /data directory permissions for imports (runs as root to ensure it works)
   docker exec proactive-config bash -c "mkdir -p /data && chmod 777 /data" 2>/dev/null || true
 
-  # If --client flag provided, handle direct import
+  # If --client was given, clear out any residue for that client first.
+  # (Preserved from the original implementation.)
   if [[ -n "${client_name}" ]]; then
-    # Check for existing client data before import
     if command -v nuke >/dev/null 2>&1; then
       local container
       container="$(docker ps --format '{{.Names}}' | grep -E '^spend-cloud-api$' | head -1)"
@@ -408,13 +317,6 @@ cluster-import() {
           _sc_warn "⚠️  Found existing data for '${client_name}'"
           _sc_info "Running automatic cleanup before import..."
 
-          # Source nuke if not already loaded
-          if ! typeset -f _nuke_execute >/dev/null 2>&1; then
-            local plugin_dir="${0:A:h}"
-            [[ -f "${plugin_dir}/nuke.zsh" ]] && source "${plugin_dir}/nuke.zsh"
-          fi
-
-          # Run nuke with force flag
           if nuke "${client_name}" --force; then
             _sc_success "✓ Cleanup complete, proceeding with import..."
           else
@@ -425,100 +327,74 @@ cluster-import() {
         fi
       fi
     fi
+  fi
 
-    local probe_output
-    probe_output="$(_cluster_import_probe "${args[@]}")"
+  # List dumps ourselves instead of driving sct's interactive menu through a
+  # pipe. gcloud keeps the terminal here, so if the session needs
+  # reauthentication it can simply ask for the password.
+  local listing
+  if ! listing="$(_cluster_import_list_dumps)"; then
+    _sc_error "Could not list dumps from ${SC_HENK_DUMP_BUCKET}/ (see the gcloud error above)."
+    _sc_info "If gcloud asked you to reauthenticate, run: ${C_WHITE}gcloud auth login${C_RESET}"
+    return 1
+  fi
 
-    local options_text
-    if ! options_text="$(_cluster_import_parse_options "${probe_output}")"; then
-      _sc_error "Unable to parse SCT cluster list."
-      return 1
-    fi
+  local options_text
+  if ! options_text="$(_cluster_import_format_dumps "${listing}")"; then
+    _sc_error "No usable dumps found in ${SC_HENK_DUMP_BUCKET}/."
+    return 1
+  fi
 
-    # Find matching client (case-insensitive)
-    local matched_number="" matched_timestamp="" num client ts
-    while IFS=$'\t' read -r num client ts; do
-      # Trim whitespace from client name
-      client="${client// /}"
+  local selected_url="" selected_client="" selected_time=""
+  local url client ts
+
+  # Direct import by client name: take that client's most recent dump.
+  if [[ -n "${client_name}" ]]; then
+    while IFS=$'\t' read -r url client ts; do
       if [[ "${client:l}" == "${client_name:l}" ]]; then
-        matched_number="${num}"
-        matched_timestamp="${ts}"
+        selected_url="${url}"
+        selected_client="${client}"
+        selected_time="${ts}"
         break
       fi
     done <<<"${options_text}"
 
-    if [[ -z "${matched_number}" ]]; then
+    if [[ -z "${selected_url}" ]]; then
       _sc_error "Client '${client_name}' not found in available dumps."
+      _sc_info "Available: $(printf '%s\n' "${options_text}" | cut -f2 | sort -u | paste -sd', ')"
       return 1
     fi
-
-    _sc_info "📥 Importing cluster dataset: ${client_name} (${matched_timestamp})"
-    _cluster_import_run_with_input "${matched_number}" "${args[@]}"
-    local exit_code=$?
-
-    if ((exit_code == 0)); then
-      _sc_success "Cluster import complete."
-      return 0
-    else
-      _sc_error "Cluster import failed."
-      return ${exit_code}
+  else
+    if ! command -v fzf >/dev/null 2>&1; then
+      _sc_warn "fzf not found; falling back to the default SCT prompt."
+      sct henk import "${args[@]}"
+      return $?
     fi
+
+    local selection
+    selection="$(printf '%s\n' "${options_text}" |
+      fzf --prompt='Import cluster > ' --with-nth=2,3 --delimiter=$'\t' \
+          --header="Select a customer dump to import" --height=60% --reverse)"
+    local pick_status=$?
+
+    if ((pick_status != 0)) || [[ -z "${selection}" ]]; then
+      _sc_warn "Cluster import selection cancelled."
+      return 130
+    fi
+
+    IFS=$'\t' read -r selected_url selected_client selected_time <<<"${selection}"
   fi
 
-  if ! command -v fzf >/dev/null 2>&1; then
-    _sc_warn "fzf not found; falling back to default SCT prompt."
-    _cluster_import_run_interactive "${args[@]}"
-    return $?
-  fi
+  _sc_info "📥 Importing cluster dataset: ${selected_client} (${selected_time})"
 
-  local probe_output
-  probe_output="$(_cluster_import_probe "${args[@]}")"
-
-  local options_text
-  if ! options_text="$(_cluster_import_parse_options "${probe_output}")"; then
-    _sc_warn "Unable to parse SCT cluster list; using default prompt."
-    _cluster_import_run_interactive "${args[@]}"
-    return $?
-  fi
-
-  local header
-  header="$(_cluster_import_header "${probe_output}")"
-  if [[ -z "${options_text}" ]]; then
-    _sc_warn "No cluster import targets detected; using default prompt."
-    _cluster_import_run_interactive "${args[@]}"
-    return $?
-  fi
-
-  local selection
-  if [[ -n "${header}" ]]; then
-    selection="$(printf '%s\n' "${options_text}" | fzf --prompt='Import cluster > ' --with-nth=2,3 --delimiter=$'\t' --header="${header}" --height=60% --reverse)"
-  else
-    selection="$(printf '%s\n' "${options_text}" | fzf --prompt='Import cluster > ' --with-nth=2,3 --delimiter=$'\t' --height=60% --reverse)"
-  fi
-
+  _cluster_import_run "${selected_url}" "${args[@]}"
   local exit_code=$?
-  if ((exit_code != 0)) || [[ -z "${selection}" ]]; then
-    _sc_warn "Cluster import selection cancelled."
-    return 130
-  fi
-
-  local number client_name timestamp
-  IFS=$'\t' read -r number client_name timestamp <<<"${selection}"
-
-  if [[ -n "${client_name}" ]]; then
-    _sc_info "📥 Importing cluster dataset: ${client_name} (${timestamp})"
-  else
-    _sc_info "📥 Importing cluster dataset #${number}"
-  fi
-
-  _cluster_import_run_with_input "${number}" "${args[@]}"
-  exit_code=$?
 
   if ((exit_code == 0)); then
     _sc_success "Cluster import complete."
     return 0
-  else
-    _sc_error "Cluster import failed."
-    return ${exit_code}
   fi
+
+  _sc_error "Cluster import failed."
+  return ${exit_code}
 }

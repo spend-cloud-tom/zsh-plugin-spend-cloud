@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub sct: records how it was invoked, and mimics henk needing a non-pipe stdin.
+{ echo "ARGV: $*"; if [ -p /dev/stdin ]; then echo "STDIN: pipe"; else echo "STDIN: not-pipe"; fi; } >> "$SCT_LOG"
+if [ -p /dev/stdin ]; then
+  echo "the input device is not a TTY" >&2
+  exit 1
+fi
+echo "Going to import ${!#}"
+exit 0

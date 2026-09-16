@@ -1,1 +1,8 @@
 lib/__pycache__
+
+# test artifacts
+test/*.log
+test/out.txt
+test/err.txt
+test/o2.txt
+test/e2.txt

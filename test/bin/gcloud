@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stub gcloud that mimics the real reauth behaviour:
+# it can only complete if stdin AND stderr are NOT pipes
+# (real gcloud requires both to be TTYs to run its reauth challenge).
+if [ -p /dev/stdin ] || [ -p /dev/stderr ]; then
+  echo "ERROR: (gcloud.storage.ls) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution." >&2
+  exit 1
+fi
+if [ "$1" = "storage" ] && [ "$2" = "ls" ]; then
+  cat <<'LIST'
+gs://henk-db-dumps/acme_2026-09-15T10:00:00.zip
+gs://henk-db-dumps/globex_2026-09-01T08:30:00.zip
+LIST
+  exit 0
+fi
+exit 0
