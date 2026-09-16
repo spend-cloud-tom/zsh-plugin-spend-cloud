@@ -196,6 +196,54 @@ _cluster_import_filter_output() {
 }
 
 #######################################
+# Detect leftover data for a client before importing over it.
+#
+# NOTE: this used to read
+#   ... | grep -qv "error:" | grep -q "."
+# which can never be true: `grep -q` prints nothing, so the second grep always
+# sees an empty stream. The database and settings probes were dead code and
+# only the /data folder test ever set the flag. Capture and inspect the output
+# instead.
+#
+# Arguments:
+#   1 - Container running artisan (spend-cloud-api)
+#   2 - Client name
+# Returns:
+#   0 if residue was found, 1 otherwise
+#######################################
+_cluster_import_has_residue() {
+  emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
+  setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
+  local MATCH REPLY; integer MBEGIN MEND; local -a match mbegin mend reply
+
+  local container="${1}" client="${2}"
+
+  # A client database whose name starts with the client name.
+  # tinker appends an "INFO  Goodbye." banner, so only the first line counts.
+  local db_match
+  db_match="$(docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${client}') === 0) { echo \$db; exit; } }" 2>/dev/null | head -1)"
+  db_match="${db_match//[[:space:]]/}"
+  if [[ -n "${db_match}" && "${db_match}" != *INFO* && "${db_match}" != *error:* ]]; then
+    return 0
+  fi
+
+  # A row for this client in the shared config table.
+  local settings_count
+  settings_count="$(docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$count = DB::connection('mysql_config')->table('00_settings')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${client}')])->count(); echo \$count;" 2>/dev/null | head -1)"
+  settings_count="${settings_count//[^0-9]/}"
+  if [[ -n "${settings_count}" ]] && ((settings_count > 0)); then
+    return 0
+  fi
+
+  # A leftover shared-storage folder.
+  if docker exec "${container}" test -d "/data/${client}" 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
+#######################################
 # Run the actual import for a dump URL.
 # stdin and stderr are deliberately left on the terminal (see file header).
 # Arguments:
@@ -288,44 +336,21 @@ cluster-import() {
   docker exec proactive-config bash -c "mkdir -p /data && chmod 777 /data" 2>/dev/null || true
 
   # If --client was given, clear out any residue for that client first.
-  # (Preserved from the original implementation.)
-  if [[ -n "${client_name}" ]]; then
-    if command -v nuke >/dev/null 2>&1; then
-      local container
-      container="$(docker ps --format '{{.Names}}' | grep -E '^spend-cloud-api$' | head -1)"
+  if [[ -n "${client_name}" ]] && command -v nuke >/dev/null 2>&1; then
+    local container
+    container="$(docker ps --format '{{.Names}}' | grep -E '^spend-cloud-api$' | head -1)"
 
-      if [[ -n "${container}" ]]; then
-        # Check if client exists in database or has data folder
-        local has_residue=0
+    if [[ -n "${container}" ]] && _cluster_import_has_residue "${container}" "${client_name}"; then
+      _sc_warn "⚠️  Found existing data for '${client_name}'"
+      _sc_info "Running automatic cleanup before import..."
 
-        # Check database existence (ignore errors - residue checks are best-effort)
-        if docker exec "${container}" php artisan tinker --execute="foreach(DB::select('SHOW DATABASES') as \$row) { \$props = get_object_vars(\$row); \$db = reset(\$props); if (stripos(\$db, '${client_name}') === 0) { echo \$db; exit; } }" 2>&1 | grep -qv "error:" | grep -q "."; then
-          has_residue=1
-        fi
-
-        # Check settings table (ignore errors - residue checks are best-effort)
-        if docker exec "${container}" php artisan tinker --execute="use Illuminate\Support\Facades\DB; \$count = DB::connection('mysql_config')->table('00_settings')->whereRaw('LOWER(\`043\`) = ?', [strtolower('${client_name}')])->count(); echo \$count;" 2>&1 | grep -qv "error:" | grep -qv "^0$"; then
-          has_residue=1
-        fi
-
-        # Check data folder
-        if docker exec "${container}" test -d "/data/${client_name}" 2>/dev/null; then
-          has_residue=1
-        fi
-
-        if ((has_residue == 1)); then
-          _sc_warn "⚠️  Found existing data for '${client_name}'"
-          _sc_info "Running automatic cleanup before import..."
-
-          if nuke "${client_name}" --force; then
-            _sc_success "✓ Cleanup complete, proceeding with import..."
-          else
-            _sc_error "Cleanup failed. Import may encounter duplicate key errors."
-            _sc_info "You can manually run: nuke ${client_name} --force"
-          fi
-          echo ""
-        fi
+      if nuke "${client_name}" --force; then
+        _sc_success "✓ Cleanup complete, proceeding with import..."
+      else
+        _sc_error "Cleanup failed. Import may encounter duplicate key errors."
+        _sc_info "You can manually run: nuke ${client_name} --force"
       fi
+      echo ""
     fi
   fi
 
